@@ -2574,15 +2574,50 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
         return True
 
-    def _is_interactive_operator_authorized(self, open_id: str) -> bool:
-        """Return whether this card-action operator may answer gated prompts."""
-        normalized = str(open_id or "").strip()
-        if not normalized:
+    @staticmethod
+    def _session_is_dm(session_key: str) -> bool:
+        """Return True when a gateway session key denotes a 1:1 (p2p) DM chat.
+
+        Feishu session keys are ``agent:<profile>:feishu:<kind>:<chat_id>`` where
+        ``kind`` is ``dm`` for p2p chats and ``group`` otherwise (see
+        ``_resolve_source_chat_type`` / gateway ``run.py``). Feishu chat ids
+        (``oc_…``) contain no colons, so the ``:dm:`` substring is unambiguous.
+        """
+        return ":dm:" in str(session_key or "")
+
+    def _interactive_action_authorized(
+        self,
+        *,
+        open_id: str = "",
+        user_id: str = "",
+        chat_id: str = "",
+        session_key: str = "",
+    ) -> bool:
+        """Authorize a card-action click (approval / update-prompt buttons).
+
+        Mirrors inbound admission (:meth:`_admit`): direct messages are *not*
+        subject to the group-policy gate. ``_admit`` returns early for non-group
+        chats and delegates DM authorization to the gateway layer that already
+        vetted the user when they sent the triggering message. Without this
+        exemption the group ``allowlist`` policy rejects the very user who is
+        allowed to DM the bot, so the approval never resolves and Feishu shows a
+        generic ``code:300000`` retry toast. Group chats keep the existing
+        :meth:`_allow_group_message` policy.
+        """
+        normalized_open = str(open_id or "").strip()
+        normalized_user = str(user_id or "").strip()
+        if not normalized_open and not normalized_user:
             return False
-        allowed_ids = set(self._admins) | set(self._allowed_group_users)
-        if not allowed_ids:
+        if self._session_is_dm(session_key):
+            # The caller has already verified the callback chat matches the
+            # card's chat, and a p2p chat has exactly one human participant, so
+            # the operator here is the same user the gateway admitted.
             return True
-        return "*" in allowed_ids or normalized in allowed_ids
+        sender_id = SimpleNamespace(
+            open_id=normalized_open or None,
+            user_id=normalized_user or None,
+        )
+        return self._allow_group_message(sender_id, chat_id, is_bot=False)
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
@@ -2598,8 +2633,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        user_id = str(getattr(operator, "user_id", "") or "")
+        if not self._interactive_action_authorized(
+            open_id=open_id,
+            user_id=user_id,
+            chat_id=state.get("chat_id", ""),
+            session_key=state.get("session_key", ""),
+        ):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2658,8 +2698,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        user_id = str(getattr(operator, "user_id", "") or "")
+        if not self._interactive_action_authorized(
+            open_id=open_id,
+            user_id=user_id,
+            chat_id=state.get("chat_id", ""),
+            session_key=state.get("session_key", ""),
+        ):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2711,7 +2756,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return
-        if not self._is_interactive_operator_authorized(open_id):
+        if not self._interactive_action_authorized(
+            open_id=open_id,
+            chat_id=chat_id or str(state.get("chat_id", "") or ""),
+            session_key=str(state.get("session_key", "") or ""),
+        ):
             logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
@@ -2750,8 +2799,11 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
         if open_id:
-            sender_id = SimpleNamespace(open_id=open_id, user_id="")
-            if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+            if not self._interactive_action_authorized(
+                open_id=open_id,
+                chat_id=chat_id or str(state.get("chat_id", "") or ""),
+                session_key=str(state.get("session_key", "") or ""),
+            ):
                 logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
                 return
         expected_chat_id = str(state.get("chat_id", "") or "")

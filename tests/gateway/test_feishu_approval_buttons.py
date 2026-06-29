@@ -313,6 +313,7 @@ class TestResolveApproval:
     @pytest.mark.asyncio
     async def test_resolves_once(self):
         adapter = _make_adapter()
+        adapter._admins = {"ou_user1"}
         adapter._approval_state[1] = {
             "session_key": "agent:main:feishu:group:oc_12345",
             "message_id": "msg_001",
@@ -328,6 +329,7 @@ class TestResolveApproval:
     @pytest.mark.asyncio
     async def test_resolves_deny(self):
         adapter = _make_adapter()
+        adapter._admins = {"ou_user1"}
         adapter._approval_state[2] = {
             "session_key": "some-session",
             "message_id": "msg_002",
@@ -342,6 +344,7 @@ class TestResolveApproval:
     @pytest.mark.asyncio
     async def test_resolves_session(self):
         adapter = _make_adapter()
+        adapter._admins = {"ou_user1"}
         adapter._approval_state[3] = {
             "session_key": "sess-3",
             "message_id": "msg_003",
@@ -356,6 +359,7 @@ class TestResolveApproval:
     @pytest.mark.asyncio
     async def test_resolves_always(self):
         adapter = _make_adapter()
+        adapter._admins = {"ou_user1"}
         adapter._approval_state[4] = {
             "session_key": "sess-4",
             "message_id": "msg_004",
@@ -872,3 +876,186 @@ class TestResolveUpdatePrompt:
 
         assert not (tmp_path / ".hermes" / ".update_response").exists()
         assert 10 in adapter._update_prompt_state
+
+
+# ===========================================================================
+# DM approval clicks must bypass the group-policy gate (regression guard)
+#
+# Root cause: in a DM the user is admitted by the gateway DM authz layer
+# (FEISHU_ALLOW_ALL_USERS / FEISHU_ALLOWED_USERS) and _admit() returns early
+# for non-group chats. The approval-button callbacks, however, used to gate the
+# click through _allow_group_message(), whose default "allowlist" policy
+# rejects any open_id absent from the (typically empty) group allowlist. The
+# click never resolved and Feishu surfaced a generic "code:300000, retry" toast.
+# ===========================================================================
+
+class TestSessionIsDm:
+    """Unit tests for the session-key DM classifier."""
+
+    @pytest.mark.parametrize(
+        "session_key,expected",
+        [
+            ("agent:main:feishu:dm:oc_ff3c754264c885d37c787a74d0a3317d", True),
+            ("agent:main:feishu:group:oc_12345", False),
+            ("agent:work:feishu:dm:oc_99", True),
+            ("", False),
+            (None, False),
+            ("agent:main:feishu:thread:oc_1", False),
+        ],
+    )
+    def test_classifies_session_key(self, session_key, expected):
+        assert FeishuAdapter._session_is_dm(session_key) is expected
+
+
+class TestInteractiveActionAuthorized:
+    """Unit tests for the card-action authorization helper."""
+
+    def _restrictive_adapter(self) -> FeishuAdapter:
+        adapter = _make_adapter()
+        # Reproduce the default deny-by-omission group posture.
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._group_policy = "allowlist"
+        adapter._default_group_policy = "allowlist"
+        adapter._group_rules = {}
+        return adapter
+
+    def test_dm_authorized_despite_empty_allowlists(self):
+        adapter = self._restrictive_adapter()
+        assert adapter._interactive_action_authorized(
+            open_id="ou_508e9f632fdc12b379274fc35f611c63",
+            chat_id="oc_dm",
+            session_key="agent:main:feishu:dm:oc_dm",
+        ) is True
+
+    def test_group_rejected_when_not_in_allowlist(self):
+        adapter = self._restrictive_adapter()
+        assert adapter._interactive_action_authorized(
+            open_id="ou_attacker",
+            chat_id="oc_group",
+            session_key="agent:main:feishu:group:oc_group",
+        ) is False
+
+    def test_group_authorized_when_in_allowlist(self):
+        adapter = self._restrictive_adapter()
+        adapter._allowed_group_users = {"ou_bob"}
+        assert adapter._interactive_action_authorized(
+            open_id="ou_bob",
+            chat_id="oc_group",
+            session_key="agent:main:feishu:group:oc_group",
+        ) is True
+
+    def test_missing_identity_fails_closed(self):
+        adapter = self._restrictive_adapter()
+        assert adapter._interactive_action_authorized(
+            open_id="",
+            user_id="",
+            chat_id="oc_dm",
+            session_key="agent:main:feishu:dm:oc_dm",
+        ) is False
+
+
+class TestDMApprovalCallbackAuthorization:
+    """End-to-end callback tests proving DM clicks resolve without an allowlist."""
+
+    def test_dm_approval_click_resolves_without_allowlist(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        # The exact failing posture from the bug report: no admins, empty
+        # allowlist, restrictive default group policy.
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._group_policy = "allowlist"
+        adapter._default_group_policy = "allowlist"
+        adapter._approval_state[1] = {
+            "session_key": "agent:main:feishu:dm:oc_dm",
+            "message_id": "msg-dm-1",
+            "chat_id": "oc_dm",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 1},
+            chat_id="oc_dm",
+            open_id="ou_508e9f632fdc12b379274fc35f611c63",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro) as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is not None
+        assert response.card.data["header"]["template"] == "green"
+        mock_submit.assert_called_once()
+
+    def test_dm_update_prompt_click_resolves_without_allowlist(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._group_policy = "allowlist"
+        adapter._default_group_policy = "allowlist"
+        adapter._update_prompt_state[1] = {
+            "session_key": "agent:main:feishu:dm:oc_dm",
+            "message_id": "msg-dm-up-1",
+            "chat_id": "oc_dm",
+        }
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 1},
+            chat_id="oc_dm",
+            open_id="ou_508e9f632fdc12b379274fc35f611c63",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro) as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is not None
+        assert response.card.data["header"]["template"] == "green"
+        mock_submit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dm_resolve_approval_unblocks_without_allowlist(self):
+        adapter = _make_adapter()
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        adapter._group_policy = "allowlist"
+        adapter._default_group_policy = "allowlist"
+        adapter._approval_state[1] = {
+            "session_key": "agent:main:feishu:dm:oc_dm",
+            "message_id": "msg-dm-1",
+            "chat_id": "oc_dm",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(
+                1, "once", "Eric",
+                open_id="ou_508e9f632fdc12b379274fc35f611c63",
+                chat_id="oc_dm",
+            )
+
+        mock_resolve.assert_called_once_with("agent:main:feishu:dm:oc_dm", "once")
+        assert 1 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_group_resolve_approval_still_rejects_outsider(self):
+        adapter = _make_adapter()
+        adapter._admins = set()
+        adapter._allowed_group_users = {"ou_member"}
+        adapter._group_policy = "allowlist"
+        adapter._default_group_policy = "allowlist"
+        adapter._approval_state[2] = {
+            "session_key": "agent:main:feishu:group:oc_group",
+            "message_id": "msg-grp-2",
+            "chat_id": "oc_group",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._resolve_approval(
+                2, "once", "Mallory",
+                open_id="ou_outsider",
+                chat_id="oc_group",
+            )
+
+        mock_resolve.assert_not_called()
+        assert 2 in adapter._approval_state
